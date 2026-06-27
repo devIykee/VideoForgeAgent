@@ -1,0 +1,63 @@
+# ── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Virtual environments ─────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Environment / secrets ────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Database (SQLite job tracking) ───────────────────────
+*.db
+*.sqlite
+*.sqlite3
+videoforge.db
+
+# ── Runtime / generated media ────────────────────────────
+# Pipeline scratch space (also lives in /tmp at runtime)
+tmp/
+videoforge/
+media/
+audio/
+out/
+*.mp4
+*.mp3
+*.wav
+*.srt
+
+# ── Local model caches ───────────────────────────────────
+.cache/
+models/
+*.pt
+*.bin
+
+# ── Logs ─────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Tooling / coverage ───────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ── IDE / OS ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
