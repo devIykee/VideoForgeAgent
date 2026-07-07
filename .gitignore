@@ -25,6 +25,13 @@ ENV/
 *.sqlite
 *.sqlite3
 videoforge.db
+minecraftcast.db
+
+# ── User uploads & generated output (keep the folders) ───
+uploads/*
+!uploads/.gitkeep
+output/*
+!output/.gitkeep
 
 # ── Runtime / generated media ────────────────────────────
 # Pipeline scratch space (also lives in /tmp at runtime)

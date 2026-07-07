@@ -15,7 +15,7 @@ import logging
 import boto3
 from botocore.config import Config as BotoConfig
 
-log = logging.getLogger("videoforge.r2")
+log = logging.getLogger("minecraftcast.r2")
 
 ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 R2_ACCESS_KEY = os.getenv("CLOUDFLARE_R2_ACCESS_KEY", "")
@@ -52,6 +52,12 @@ async def upload(job_id: str, video_path: str) -> str:
     """Upload the video to R2 and return its public URL. Blocking boto3 work is
     offloaded to a thread."""
     return await asyncio.to_thread(_upload_sync, job_id, video_path)
+
+
+# Spec alias used by integrations/croo_provider.py.
+async def upload_video(job_id: str, video_path: str) -> str:
+    """Upload a finished video to R2 and return its public URL."""
+    return await upload(job_id, video_path)
 
 
 def _upload_sync(job_id: str, video_path: str) -> str:

@@ -1,424 +1,194 @@
-"""VideoForge AI Script Engine — the core creative skill.
+"""Groq-powered dialogue script generator for MinecraftCast.
 
-Produces broadcast-quality, retention-optimized video scripts as strict JSON
-via a pluggable AI provider (see tools/providers.py): `complete()` generates the
-full script; `fast_complete()` optimizes stock-footage search queries on demand.
-
-This module is intentionally self-contained and defensive: it validates and
-auto-repairs model output, and retries with self-correction feedback so the rest
-of the pipeline always receives a clean, schema-conformant script dict.
+Produces a structured, validated JSON script describing a back-and-forth
+conversation between two characters reacting to Minecraft gameplay. Groq exposes
+an OpenAI-compatible endpoint, so we drive it with the ``openai`` async client
+pointed at Groq's base URL.
 """
 
-import re
+import os
 import json
-import logging
+import asyncio
 
-from tools.providers import get_provider
+from openai import AsyncOpenAI, RateLimitError
 
-log = logging.getLogger("videoforge.script")
+from config import VideoConfig
 
-# The AI backend is chosen via the AI_PROVIDER env var (see tools/providers.py).
-# Loaded once at module import; reused for every script and query call.
-ai = get_provider()
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Words spoken per second at a natural narration pace (150 wpm == 2.5 wps).
-WORDS_PER_SECOND = 2.5
+# A single shared async client. Created lazily so importing this module never
+# requires an API key to be present.
+_groq_client: AsyncOpenAI | None = None
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+
+def _client() -> AsyncOpenAI:
+    """Return the shared Groq client, creating it on first use."""
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = AsyncOpenAI(
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url=GROQ_BASE_URL,
+        )
+    return _groq_client
+
 
 MASTER_SYSTEM_PROMPT = """
-You are VideoForge — the world's most advanced AI video script generator.
-You have deep expertise in:
-- YouTube retention psychology (pattern interrupts, open loops, hooks)
-- Documentary storytelling (tension arcs, revelation structure)
-- Viral short-form content (3-second hooks, single insight, strong CTA)
-- Stock footage optimization (knowing exactly what search terms yield great clips)
-- Narration pacing (150 words = exactly 60 seconds at natural pace)
+You are MinecraftCast Script AI — you write viral, entertaining dialogue
+scripts for Minecraft faceless YouTube videos.
 
-Your output is always a single valid JSON object. No markdown fences.
-No explanation. No preamble. Just the JSON.
+Two characters talk to each other like real people — natural, funny, reactive.
+They're watching/experiencing Minecraft gameplay and reacting to it in real time.
 
-OUTPUT SCHEMA (follow exactly):
+ALWAYS return only valid JSON. No markdown fences. No explanation. Just JSON.
+
+OUTPUT SCHEMA:
 {
   "title": string,
-  "style": "explainer|documentary|shorts|faceless|slideshow",
+  "youtube_title": string,
   "total_duration_seconds": number,
-  "target_resolution": "1920x1080|1080x1920",
-  "hook": string,
-  "hook_type": "question|bold_claim|shocking_stat|story_open|contrarian",
-  "chapters": [
+  "segments": [
     {
-      "chapter_index": number,
-      "title": string,
-      "chapter_purpose": "intro|buildup|climax|resolution|cta",
-      "scenes": [
-        {
-          "scene_index": number,
-          "duration_seconds": number,
-          "narration": string,
-          "narration_word_count": number,
-          "visual_description": string,
-          "pexels_video_query": string,
-          "pexels_image_query": string,
-          "pixabay_video_query": string,
-          "pixabay_image_query": string,
-          "visual_type": "video|image",
-          "emotion": "inspiring|educational|dramatic|calm|exciting|curious|urgent",
-          "retention_device": "pattern_interrupt|open_loop|payoff|curiosity_gap|social_proof|null",
-          "text_overlay": string|null,
-          "text_overlay_position": "top|middle|bottom|null",
-          "transition": "cut|fade|dissolve",
-          "color_grade": "warm|cool|neutral|cinematic|vibrant",
-          "music_intensity": "low|medium|high"
-        }
-      ]
+      "segment_index": number,
+      "type": "dialogue" | "narration",
+      "speaker": "char1" | "char2" | "narrator",
+      "text": string,
+      "word_count": number,
+      "duration_seconds": number,
+      "emotion": "excited" | "scared" | "skeptical" | "laughing" | "serious" | "curious" | "shocked" | "smug",
+      "minecraft_action": string,
+      "footage_timestamp_hint": string
     }
   ],
-  "background_music_mood": "uplifting|dramatic|calm|energetic|mysterious|tense",
-  "color_grade_global": "warm|cool|neutral|cinematic|vibrant",
-  "style_notes": string,
-  "seo_title": string,
-  "seo_description": string,
-  "suggested_thumbnail_scene_index": number
+  "footage_search_query": string,
+  "background_music_mood": "chill" | "tense" | "upbeat" | "mysterious",
+  "thumbnail_segment_index": number
 }
 
-STRICT RULES:
-1. narration_word_count = duration_seconds * 2.5 (150wpm). Calculate this precisely.
-   If narration has wrong word count, rewrite it until it matches.
-2. Hook must land in first 3 seconds. Make it impossible to skip.
-3. Every pexels/pixabay query: 2-4 concrete nouns only. No adjectives of quality.
-   GOOD: "city skyline night timelapse" BAD: "beautiful amazing urban landscape"
-4. Shorts: total_duration_seconds <= 58, target_resolution = 1080x1920,
-   max 1 chapter, pattern_interrupt every 10 seconds.
-5. Documentary: minimum 3 chapters, use open_loop in chapter 1, payoff in final chapter.
-6. Explainer: build concept progressively, use curiosity_gap between chapters.
-7. Every 5th scene must have a retention_device (not null) — this keeps viewers watching.
-8. suggested_thumbnail_scene_index: pick the scene with highest visual impact.
-9. Return ONLY the JSON object. Nothing before or after it.
+RULES:
+- word_count * 0.4 = duration_seconds (approx 150wpm)
+- Always start with char1 saying a hook line that grabs attention immediately
+- Characters must reference what the other just said — real conversation, not monologue
+- char1 and char2 must have distinctly different speaking styles matching their personalities
+- minecraft_action: what's happening in Minecraft at this exact moment
+  (e.g. "player finds diamond", "creeper explosion destroys house", "falling into void")
+  This is used to find relevant footage clips.
+- footage_timestamp_hint: rough timestamp in the footage to use
+  (e.g. "0:30", "2:15", "4:00") — spread across the video
+- narration segments: used for transitions ("Meanwhile, deeper in the cave...")
+- Every 4-5 segments, insert something unexpected to keep viewer watching
+- footage_search_query: best search term for Minecraft footage matching the topic
+- Return ONLY JSON. Absolutely nothing else.
 """
 
-STYLE_USER_PROMPTS = {
-    "explainer": """
-Create a clear, educational explainer video about: {topic}
-Target audience: {target_audience}
-Tone: {tone}
-Duration: {duration_minutes} minutes
 
-Structure:
-- Chapter 1: Hook + "here's what most people get wrong about {topic}"
-- Chapter 2-N: Build concept from basics to advanced, one idea per chapter
-- Final chapter: Summary + surprising insight + soft CTA
+async def generate_script(config: VideoConfig) -> dict:
+    """Generate a full dialogue script via Groq.
 
-Use analogies. Every complex idea needs a real-world comparison.
-Insert curiosity gaps between chapters ("but here's where it gets interesting...").
-""",
+    Retries up to three times, feeding validation errors back into the prompt so
+    the model can self-correct. Raises RuntimeError if all attempts fail.
+    """
+    style_note = ""
+    if config.duration_minutes <= 3:
+        style_note = "This is a SHORT video. Hook immediately. One main idea. Fast pacing."
+    elif config.duration_minutes >= 10:
+        style_note = "This is a LONG video. Multiple acts. Build tension. Reward at the end."
 
-    "documentary": """
-Create a cinematic documentary script about: {topic}
-Tone: {tone}
-Duration: {duration_minutes} minutes
+    user_prompt = f"""
+Topic: {config.topic}
+Duration: {config.duration_minutes} minutes ({int(config.duration_minutes * 60)} seconds total)
 
-Structure (strict):
-- Cold open: Drop into the most dramatic moment first (in medias res)
-- Chapter 1: Context + open loop ("the answer to this question changed everything")
-- Middle chapters: Build tension, introduce conflict or mystery
-- Climax: The revelation or turning point
-- Resolution: What this means for the viewer
+Character 1: {config.char1.name}
+Personality: {config.char1.personality}
 
-Use the "but/therefore" rule: never connect scenes with "and then".
-Always connect with "but" (conflict) or "therefore" (consequence).
-""",
+Character 2: {config.char2.name}
+Personality: {config.char2.personality}
 
-    "shorts": """
-Create a viral short-form script about: {topic}
-Duration: EXACTLY 55 seconds. Not more.
-Target: {target_audience}
+{style_note}
 
-STRUCTURE (non-negotiable):
-Seconds 0-3: HOOK — one sentence that creates immediate curiosity or shock
-Seconds 4-35: THE MEAT — one key insight, explained fast with one example
-Seconds 36-50: THE TWIST — something they didn't expect
-Seconds 51-55: CTA — "follow for more like this" or question to answer in comments
+Write the complete script. Make it feel like a real podcast or react video.
+The characters are experiencing Minecraft gameplay happening on screen behind them.
+Be entertaining. Be natural. Let personalities clash and complement each other.
+"""
 
-Pattern interrupt every 10 seconds: change visual, change pacing, add text.
-Write like you're talking to a friend, not presenting to a boardroom.
-""",
-
-    "faceless": """
-Create a faceless YouTube video script about: {topic}
-Tone: {tone}
-Duration: {duration_minutes} minutes
-Target: {target_audience}
-
-RETENTION RULES (YouTube algorithm):
-- Hook in first 30 seconds must tease the payoff ("by the end of this video...")
-- Pattern interrupt every 60 seconds minimum
-- Use "you" constantly — make it personal
-- Open loop in intro, close it only in final chapter
-- Every chapter title should be a curiosity trigger
-
-STOCK FOOTAGE OPTIMIZATION:
-- Write visual_descriptions assuming only generic stock footage exists
-- Avoid anything requiring specific people, brands, or locations
-- Prefer: nature, technology, abstract, city, workspace, hands, data visualizations
-""",
-
-    "slideshow": """
-Create a slideshow-style video script about: {topic}
-Tone: {tone}
-Duration: {duration_minutes} minutes
-
-Each scene = one slide concept. Keep narration tight (max 25 words per scene).
-Visual type should always be "image" for slides.
-text_overlay should always be set — it's the slide title.
-Color grade: neutral or cool for professional feel.
-""",
-}
-
-
-# ---------------------------------------------------------------------------
-# Public pipeline entrypoint
-# ---------------------------------------------------------------------------
-
-async def generate(req: dict) -> dict:
-    """Pipeline-facing wrapper. Unpacks an order requirements dict and returns
-    a validated script dict."""
-    topic = req.get("topic") or req.get("subject") or "an interesting topic"
-    style = (req.get("style") or "faceless").lower()
-    if style not in STYLE_USER_PROMPTS:
-        style = "faceless"
-    duration_minutes = req.get("duration_minutes") or req.get("duration") or 3
-    tone = req.get("tone") or "engaging and authoritative"
-    target_audience = req.get("target_audience") or "a general audience"
-
-    return await generate_script(
-        topic=topic,
-        style=style,
-        duration_minutes=duration_minutes,
-        tone=tone,
-        target_audience=target_audience,
-    )
-
-
-async def generate_script(topic, style, duration_minutes, tone, target_audience) -> dict:
-    """Main script generation. Calls the configured AI provider. Validates.
-    Auto-retries up to 3 times, appending the previous error so the model
-    self-corrects."""
-    user_prompt = STYLE_USER_PROMPTS[style].format(
-        topic=topic,
-        duration_minutes=duration_minutes,
-        tone=tone,
-        target_audience=target_audience,
-    )
-
-    last_error: Exception | None = None
     for attempt in range(3):
-        log.info("Generating script (style=%s) attempt %d/3", style, attempt + 1)
-        raw = await ai.complete(
-            system=MASTER_SYSTEM_PROMPT,
-            user=user_prompt,
-            max_tokens=6000,
-            temperature=0.7,
-        )
-        raw = raw.strip()
-
         try:
-            script = json.loads(_strip_json(raw))
-            validate_and_fix_script(script)  # raises ValueError if unfixable
-            log.info("Script validated: %s (%d chapters)",
-                     script.get("title"), len(script.get("chapters", [])))
-            return script
-        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
-            last_error = e
-            log.warning("Script attempt %d failed: %s", attempt + 1, e)
-            if attempt == 2:
-                raise RuntimeError(
-                    f"AI provider failed to produce valid script after 3 attempts: {e}"
-                )
-            user_prompt += f"\n\nPREVIOUS ATTEMPT FAILED: {e}. Fix this and try again."
-
-    # Unreachable, but keeps type-checkers happy.
-    raise RuntimeError(f"AI provider failed to produce valid script: {last_error}")
-
-
-async def optimize_search_queries(visual_description: str) -> dict:
-    """When Pexels/Pixabay returns 0 results, use the provider's fast model to
-    generate 5 alternative search terms ranked by stock-footage availability."""
-    raw = await ai.fast_complete(
-        user=f"""
-Visual description: "{visual_description}"
-
-Generate 5 stock footage search queries for this scene, ranked best to worst.
-Each query: 2-4 concrete nouns only. No adjectives.
-Return JSON only: {{"queries": ["query1", "query2", "query3", "query4", "query5"]}}
-""",
-        max_tokens=200,
-    )
-    raw = raw.strip()
-    try:
-        data = json.loads(_strip_json(raw))
-        queries = [q for q in data.get("queries", []) if isinstance(q, str) and q.strip()]
-        return {"queries": queries}
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return {"queries": []}
-
-
-# ---------------------------------------------------------------------------
-# Validation / repair
-# ---------------------------------------------------------------------------
-
-def validate_and_fix_script(script: dict) -> None:
-    """Validate schema and auto-fix what can be fixed. Raises ValueError for
-    unfixable issues. Mutates `script` in place."""
-    if not isinstance(script, dict):
-        raise ValueError("Top-level script is not a JSON object")
-
-    required_top = ["title", "style", "total_duration_seconds", "chapters",
-                    "background_music_mood", "target_resolution"]
-    for field in required_top:
-        if field not in script:
-            raise ValueError(f"Missing required field: {field}")
-
-    if not isinstance(script["chapters"], list) or not script["chapters"]:
-        raise ValueError("chapters must be a non-empty list")
-
-    # Sensible defaults for optional top-level fields the pipeline relies on.
-    script.setdefault("color_grade_global", "neutral")
-    script.setdefault("hook", script["title"])
-    script.setdefault("style_notes", "")
-    script.setdefault("seo_title", script["title"])
-    script.setdefault("seo_description", "")
-
-    total_scene_duration = 0.0
-    scene_counter = 0
-
-    for chapter in script["chapters"]:
-        if "scenes" not in chapter or not isinstance(chapter["scenes"], list) \
-                or not chapter["scenes"]:
-            raise ValueError(
-                f"Chapter {chapter.get('chapter_index', '?')} has no scenes"
+            response = await _client().chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": MASTER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.8,
+                max_tokens=6000,
             )
+            raw = (response.choices[0].message.content or "").strip()
+            raw = _strip_fences(raw)
+            script = json.loads(raw)
+            validate_script(script)
+            _normalize_script(script, config)
+            return script
+        except (json.JSONDecodeError, ValueError) as e:
+            if attempt == 2:
+                raise RuntimeError(f"Script generation failed after 3 attempts: {e}")
+            user_prompt += f"\n\nERROR IN PREVIOUS ATTEMPT: {e}\nFix this and try again."
+        except RateLimitError:
+            await asyncio.sleep(10 * (attempt + 1))
 
-        for scene in chapter["scenes"]:
-            for f in ("narration", "duration_seconds"):
-                if f not in scene:
-                    raise ValueError(
-                        f"Scene {scene.get('scene_index', '?')} missing '{f}'"
-                    )
-
-            # Normalize duration to a positive number.
-            try:
-                scene["duration_seconds"] = max(1.0, float(scene["duration_seconds"]))
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"Scene {scene.get('scene_index', '?')} has invalid duration"
-                )
-
-            # Auto-fix / record actual narration word count.
-            actual_words = len(str(scene["narration"]).split())
-            expected_words = int(scene["duration_seconds"] * WORDS_PER_SECOND)
-            scene["narration_word_count"] = actual_words
-
-            # Off by >20%: tolerated — assembly retimes to real audio length.
-            if expected_words and abs(actual_words - expected_words) > expected_words * 0.2:
-                log.debug(
-                    "Scene %s narration off pace (%d words vs ~%d expected)",
-                    scene.get("scene_index"), actual_words, expected_words,
-                )
-
-            # Fill defaults so downstream tools never KeyError.
-            scene.setdefault("scene_index", scene_counter)
-            scene.setdefault("visual_type", "video")
-            scene.setdefault("visual_description", scene.get("narration", "")[:120])
-            scene.setdefault("emotion", "educational")
-            scene.setdefault("transition", "cut")
-            scene.setdefault("color_grade", script["color_grade_global"])
-            scene.setdefault("music_intensity", "medium")
-            scene.setdefault("text_overlay", None)
-            scene.setdefault("text_overlay_position", None)
-            scene.setdefault("retention_device", None)
-            _fill_query_defaults(scene)
-
-            # Validate the two primary Pexels queries are 2-5 words.
-            for query_field in ["pexels_video_query", "pexels_image_query"]:
-                query = scene.get(query_field, "")
-                words = len(str(query).split())
-                if words < 2 or words > 5:
-                    raise ValueError(
-                        f"Scene {scene['scene_index']}: {query_field} must be "
-                        f"2-4 words, got: '{query}'"
-                    )
-
-            total_scene_duration += scene["duration_seconds"]
-            scene_counter += 1
-
-    # Keep the declared total honest.
-    script["total_duration_seconds"] = round(total_scene_duration, 2)
-
-    if script["style"] == "shorts" and script["total_duration_seconds"] > 60:
-        raise ValueError(
-            f"Shorts must be <= 60 seconds, got {script['total_duration_seconds']}"
-        )
+    raise RuntimeError("Script generation failed after 3 attempts")
 
 
-def _fill_query_defaults(scene: dict) -> None:
-    """Derive sensible 2-4 word search queries from the visual description when
-    a query field is missing, empty, or out of bounds."""
-    fallback = _derive_query(scene.get("visual_description") or scene.get("narration", ""))
-    for f in ("pexels_video_query", "pexels_image_query",
-              "pixabay_video_query", "pixabay_image_query"):
-        q = str(scene.get(f, "") or "").strip()
-        if not (2 <= len(q.split()) <= 5):
-            scene[f] = fallback
+def _strip_fences(raw: str) -> str:
+    """Remove accidental ```json code fences the model may add despite instructions."""
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    return raw
 
 
-def _derive_query(text: str) -> str:
-    """Reduce arbitrary text to 3 concrete-ish lowercase keywords."""
-    words = re.findall(r"[A-Za-z]+", text.lower())
-    stop = {"the", "a", "an", "of", "and", "to", "in", "on", "with", "for",
-            "is", "are", "this", "that", "as", "at", "by", "it", "its", "into",
-            "from", "your", "you", "we", "our", "their", "his", "her"}
-    keep = [w for w in words if w not in stop and len(w) > 2]
-    chosen = keep[:3] if len(keep) >= 2 else (keep + ["abstract", "background"])[:3]
-    return " ".join(chosen) if chosen else "abstract background motion"
+def validate_script(script: dict) -> None:
+    """Validate the script schema. Raise ValueError if invalid."""
+    required = ["title", "total_duration_seconds", "segments",
+                "footage_search_query", "background_music_mood"]
+    for field in required:
+        if field not in script:
+            raise ValueError(f"Missing field: {field}")
+    if not isinstance(script["segments"], list) or len(script["segments"]) < 3:
+        raise ValueError("Script must have at least 3 segments")
+    for seg in script["segments"]:
+        if seg.get("speaker") not in ("char1", "char2", "narrator"):
+            raise ValueError(f"Invalid speaker: {seg.get('speaker')}")
+        if "text" not in seg or len(seg["text"]) < 5:
+            raise ValueError(f"Segment {seg.get('segment_index')} has no text")
 
 
-def _strip_json(raw: str) -> str:
-    """Strip accidental markdown fences and isolate the outermost JSON object."""
-    s = raw.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
-        s = re.sub(r"\n?```$", "", s).strip()
-    start = s.find("{")
-    end = s.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return s[start:end + 1]
-    return s
+def _normalize_script(script: dict, config: VideoConfig) -> None:
+    """Fill in missing per-segment fields so downstream stages never KeyError.
 
+    The model is reliable but not perfect; we defensively re-derive indices,
+    word counts, and durations, and supply sane defaults for optional fields.
+    """
+    for i, seg in enumerate(script["segments"]):
+        seg["segment_index"] = i
+        seg.setdefault("type", "dialogue")
+        seg.setdefault("emotion", "curious")
+        seg.setdefault("minecraft_action", "")
+        seg.setdefault("footage_timestamp_hint", "")
 
-# ---------------------------------------------------------------------------
-# Style / rendering helpers (consumed by voice.py and assembly.py)
-# ---------------------------------------------------------------------------
+        words = len(seg["text"].split())
+        seg["word_count"] = words
+        # 150 wpm ≈ 0.4s per word; enforce a minimum so very short lines still play.
+        seg["duration_seconds"] = max(1.5, round(words * 0.4, 2))
 
-def get_voice_for_style(style: str) -> str:
-    """Return best Kokoro voice ID for each video style."""
-    return {
-        "documentary": "am_echo",    # deep, authoritative
-        "shorts": "af_sky",          # energetic, young
-        "explainer": "af_heart",     # warm, clear
-        "faceless": "af_heart",      # warm, clear
-        "slideshow": "af_heart",     # warm, clear
-    }.get(style, "af_heart")
-
-
-def get_ffmpeg_color_grade(grade: str) -> str:
-    """Return FFmpeg vf filter string for each color grade ('' = no filter)."""
-    return {
-        "warm": "curves=r='0/0 0.5/0.6 1/1':g='0/0 0.5/0.5 1/0.9':b='0/0 0.5/0.4 1/0.8'",
-        "cool": "curves=r='0/0 0.5/0.4 1/0.8':g='0/0 0.5/0.5 1/0.95':b='0/0 0.5/0.6 1/1'",
-        "cinematic": "curves=all='0/0 0.5/0.45 1/0.9',vignette=PI/4",
-        "vibrant": "eq=saturation=1.4:contrast=1.05:brightness=0.02",
-        "neutral": "",
-    }.get(grade, "")
+    # Recompute the total from segment durations to keep music fades accurate.
+    script["total_duration_seconds"] = round(
+        sum(s["duration_seconds"] for s in script["segments"]), 2
+    )
+    script.setdefault("youtube_title", script.get("title", config.topic))
+    script.setdefault("thumbnail_segment_index", 0)
+    if script.get("background_music_mood") not in ("chill", "tense", "upbeat", "mysterious"):
+        script["background_music_mood"] = "chill"

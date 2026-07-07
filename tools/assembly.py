@@ -1,246 +1,189 @@
-"""FFmpeg assembly pipeline (subprocess-based for reliability).
+"""Final FFmpeg assembly for MinecraftCast.
 
-Each scene is rendered to a normalized, self-contained MP4 (matching resolution,
-fps, codecs) with: source scaling/padding or Ken Burns, color grade, burned-in
-captions, optional text overlay, and muxed narration audio. Scenes are then
-concatenated and a background-music bed is mixed under the narration.
+Composites each segment — darkened Minecraft footage as the background, the two
+avatar clips overlaid in the bottom corners (the speaker in full color, the
+listener desaturated), and a subtitle bar — then concatenates all segments and
+mixes in low-volume background music.
+
+Layout (1920x1080):
+    ┌─────────────────────────────────────────────┐
+    │            Minecraft footage (darkened)       │
+    │  ┌────────┐                     ┌────────┐    │
+    │  │ CHAR 1 │                     │ CHAR 2 │    │
+    │  │300x380 │                     │300x380 │    │
+    │  └────────┘                     └────────┘    │
+    │  x=40,y=640                     x=1580,y=640  │
+    │  ═══════════════════════════════════════════  │
+    │  [NAME]: dialogue text                        │
+    └─────────────────────────────────────────────┘
+
+All FFmpeg calls go through subprocess (no ffmpeg-python wrapper).
 """
 
 import os
 import json
-import asyncio
-import logging
 import subprocess
 
-from tools import script as script_engine
-
-log = logging.getLogger("videoforge.assembly")
-
-FPS = 30
-SCENE_CRF = "23"
-PRESET = "medium"
+from config import VideoConfig
 
 
-def _out_dir(job_id: str) -> str:
-    d = f"/tmp/videoforge/{job_id}/out"
-    os.makedirs(d, exist_ok=True)
-    return d
+def _escape_drawtext(text: str) -> str:
+    """Escape a string for safe use inside an FFmpeg drawtext ``text=`` value."""
+    # Order matters: backslash first, then the characters FFmpeg treats specially.
+    text = text.replace("\\", "\\\\")
+    text = text.replace("'", "’")   # curly apostrophe dodges quote parsing
+    text = text.replace(":", "\\:")
+    text = text.replace("%", "\\%")
+    return text
 
 
-async def build(job_id, media, audio, srt, music_path, script) -> str:
-    """Assemble the final MP4. Runs the blocking FFmpeg work in a thread."""
-    return await asyncio.to_thread(
-        assemble_video, job_id, media, audio, srt, music_path, script
+def _probe_duration(audio_path: str) -> float:
+    """Return the duration in seconds of an audio file via ffprobe."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_streams", audio_path],
+        capture_output=True, text=True,
+    )
+    probe_data = json.loads(probe.stdout)
+    return float(probe_data["streams"][0]["duration"])
+
+
+# Desaturation matrix applied to the non-speaking avatar.
+_DESAT = "colorchannelmixer=.4:.2:.2:0:.2:.4:.2:0:.2:.2:.4"
+
+
+def assemble_segment(seg_idx: int, seg: dict,
+                     footage_path: str,
+                     audio_path: str,
+                     char1_avatar_path: str,
+                     char2_avatar_path: str,
+                     config: VideoConfig,
+                     job_id: str) -> str:
+    """Assemble one segment clip. Returns the segment MP4 path."""
+    output_path = f"/tmp/minecraftcast/{job_id}/segments/seg_{seg_idx:03d}.mp4"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    duration = _probe_duration(audio_path)
+
+    # Spread the footage window across the source to avoid visible repetition.
+    footage_offset = (seg_idx * 30) % 600  # stay within the first 10 minutes
+
+    # Subtitle text: "Speaker: line".
+    speaker_label = {
+        "char1": config.char1.name,
+        "char2": config.char2.name,
+        "narrator": "Narrator",
+    }[seg["speaker"]]
+    subtitle_text = _escape_drawtext(f"{speaker_label}: {seg['text']}"[:120])
+
+    char1_is_speaking = seg["speaker"] == "char1"
+
+    # Build the complex filter graph.
+    # Inputs: 0=footage, 1=char1 avatar, 2=char2 avatar, 3=audio.
+    filter_complex = (
+        # Trim + scale footage to 1920x1080, then darken it.
+        f"[0:v]trim=start={footage_offset}:duration={duration},"
+        f"setpts=PTS-STARTPTS,"
+        f"scale=1920:1080:force_original_aspect_ratio=increase,"
+        f"crop=1920:1080,"
+        f"colorchannelmixer=.6:.6:.6:0:.6:.6:.6:0:.6:.6:.6[bg];"
+        # Scale avatar inputs.
+        f"[1:v]scale=300:380[char1v];"
+        f"[2:v]scale=300:380[char2v];"
     )
 
-
-def assemble_video(job_id, media, audio, srt, music_path, script) -> str:
-    out_dir = _out_dir(job_id)
-    resolution = script.get("target_resolution", "1920x1080")
-    width, height = (int(x) for x in resolution.split("x"))
-    is_shorts = script.get("style") == "shorts" or height > width
-
-    scenes = [s for ch in script.get("chapters", []) for s in ch.get("scenes", [])]
-
-    scene_files: list[str] = []
-    total_duration = 0.0
-
-    for scene in scenes:
-        idx = scene["scene_index"]
-        media_path = media.get(idx)
-        audio_path = audio.get(idx)
-        srt_path = srt.get(idx)
-
-        if not media_path or not audio_path:
-            log.warning("Scene %s missing media/audio; skipping", idx)
-            continue
-
-        dur = _audio_duration(audio_path)
-        total_duration += dur
-
-        scene_out = os.path.join(out_dir, f"scene_{idx}_final.mp4")
-        _render_scene(
-            scene, media_path, audio_path, srt_path, scene_out,
-            width, height, dur, is_shorts,
-        )
-        scene_files.append(scene_out)
-
-    if not scene_files:
-        raise RuntimeError("No scenes were rendered; cannot assemble video")
-
-    final_path = os.path.join(out_dir, "output.mp4")
-    _concat_with_music(scene_files, music_path, final_path, total_duration, out_dir)
-    log.info("Assembled final video: %s (%.1fs)", final_path, total_duration)
-    return final_path
-
-
-# ---------------------------------------------------------------------------
-# Per-scene rendering
-# ---------------------------------------------------------------------------
-
-def _render_scene(scene, media_path, audio_path, srt_path, out_path,
-                  width, height, duration, is_shorts) -> None:
-    ext = os.path.splitext(media_path)[1].lower()
-    is_image = ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp")
-
-    vf = _build_filter_chain(scene, srt_path, width, height, duration,
-                             is_shorts, is_image)
-
-    cmd = ["ffmpeg", "-y"]
-    if is_image:
-        cmd += ["-loop", "1", "-t", f"{duration:.3f}", "-i", media_path]
-    else:
-        # Loop short clips so they always cover the narration duration.
-        cmd += ["-stream_loop", "-1", "-t", f"{duration:.3f}", "-i", media_path]
-    cmd += ["-i", audio_path]
-
-    cmd += [
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-vf", vf,
-        "-t", f"{duration:.3f}",
-        "-r", str(FPS),
-        "-pix_fmt", "yuv420p",
-        "-c:v", "libx264", "-crf", SCENE_CRF, "-preset", PRESET,
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-shortest",
-        out_path,
-    ]
-    _run(cmd, f"render scene {scene.get('scene_index')}")
-
-
-def _build_filter_chain(scene, srt_path, width, height, duration,
-                        is_shorts, is_image) -> str:
-    parts: list[str] = []
-
-    if is_image and is_shorts:
-        # Ken Burns: oversize then slow zoom over the scene duration.
-        frames = max(1, int(duration * FPS))
-        parts.append(
-            f"scale={int(width * 1.3)}:{int(height * 1.3)}:"
-            f"force_original_aspect_ratio=increase"
-        )
-        parts.append(
-            f"zoompan=z='min(zoom+0.0012,1.4)':d={frames}:"
-            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={width}x{height}:fps={FPS}"
+    # Desaturate the non-speaking avatar, then overlay both.
+    if char1_is_speaking:
+        filter_complex += f"[char2v]{_DESAT}[char2vd];"
+        filter_complex += (
+            f"[bg][char1v]overlay=x=40:y=640[tmp1];"
+            f"[tmp1][char2vd]overlay=x=1580:y=640[tmp2];"
         )
     else:
-        parts.append(
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease"
-        )
-        parts.append(
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
-        )
-    parts.append("setsar=1")
-
-    # Color grade.
-    grade = script_engine.get_ffmpeg_color_grade(scene.get("color_grade", "neutral"))
-    if grade:
-        parts.append(grade)
-
-    # Burn captions.
-    if srt_path and os.path.exists(srt_path):
-        font_size = 28 if is_shorts else 18
-        style = (
-            f"FontSize={font_size},"
-            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-            "Outline=2,Shadow=0,BorderStyle=1,Alignment=2,MarginV=40"
-        )
-        parts.append(f"subtitles='{_escape_path(srt_path)}':force_style='{style}'")
-
-    # Optional text overlay (top-third by default).
-    overlay = scene.get("text_overlay")
-    if overlay:
-        pos = scene.get("text_overlay_position") or "top"
-        y = {"top": "h/8", "middle": "(h-text_h)/2", "bottom": "h-h/6"}.get(pos, "h/8")
-        font = _find_font()
-        font_clause = f"fontfile='{_escape_path(font)}':" if font else ""
-        size = 56 if is_shorts else 40
-        parts.append(
-            f"drawtext={font_clause}text='{_escape_text(overlay)}':"
-            f"fontcolor=white:fontsize={size}:borderw=3:bordercolor=black@0.8:"
-            f"x=(w-text_w)/2:y={y}"
+        filter_complex += f"[char1v]{_DESAT}[char1vd];"
+        filter_complex += (
+            f"[bg][char1vd]overlay=x=40:y=640[tmp1];"
+            f"[tmp1][char2v]overlay=x=1580:y=640[tmp2];"
         )
 
-    return ",".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Concat + music mix
-# ---------------------------------------------------------------------------
-
-def _concat_with_music(scene_files, music_path, final_path, total, out_dir) -> None:
-    list_path = os.path.join(out_dir, "concat.txt")
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in scene_files:
-            f.write(f"file '{os.path.abspath(p)}'\n")
-
-    fade_out_start = max(total - 3.0, 0.0)
-    filter_complex = (
-        f"[1:a]volume=0.08,afade=t=in:d=2,"
-        f"afade=t=out:st={fade_out_start:.3f}:d=3[bg];"
-        f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
+    # Subtitle bar via drawtext.
+    filter_complex += (
+        f"[tmp2]drawtext="
+        f"text='{subtitle_text}':"
+        f"fontcolor=white:"
+        f"fontsize=28:"
+        f"bordercolor=black:"
+        f"borderw=3:"
+        f"x=(w-text_w)/2:"
+        f"y=h-60:"
+        f"box=1:"
+        f"boxcolor=black@0.5:"
+        f"boxborderw=8[outv]"
     )
 
     cmd = [
         "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0", "-i", list_path,
-        "-i", music_path,
+        "-i", footage_path,       # input 0: footage
+        "-i", char1_avatar_path,  # input 1: char1 avatar video
+        "-i", char2_avatar_path,  # input 2: char2 avatar video
+        "-i", audio_path,         # input 3: dialogue audio
         "-filter_complex", filter_complex,
-        "-map", "0:v", "-map", "[a]",
-        "-c:v", "libx264", "-crf", "23", "-preset", PRESET,
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        final_path,
+        "-map", "[outv]",
+        "-map", "3:a",
+        "-c:v", "libx264",
+        "-crf", "23",
+        "-preset", "medium",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-t", str(duration),
+        output_path,
     ]
-    _run(cmd, "concat + music mix")
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def concatenate_segments(segment_paths: list, music_path: str,
+                         total_duration: float, job_id: str,
+                         config: VideoConfig) -> str:
+    """Concatenate all segment clips and mix in background music.
 
-def _audio_duration(path: str) -> float:
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "json", path],
-            check=True, capture_output=True,
-        )
-        return max(0.5, float(json.loads(out.stdout)["format"]["duration"]))
-    except Exception as e:
-        log.warning("ffprobe failed for %s (%s); defaulting to 5s", path, e)
-        return 5.0
+    Returns the path to the final MP4 under ``output/``.
+    """
+    concat_list = f"/tmp/minecraftcast/{job_id}/concat_list.txt"
+    with open(concat_list, "w") as f:
+        for path in segment_paths:
+            f.write(f"file '{path}'\n")
 
+    output_path = f"output/{job_id}_final.mp4"
+    os.makedirs("output", exist_ok=True)
 
-def _run(cmd: list[str], label: str) -> None:
-    log.debug("FFmpeg [%s]: %s", label, " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "ignore")[-1500:]
-        raise RuntimeError(f"FFmpeg failed during {label}:\n{err}")
+    fade_out_start = max(0.0, total_duration - 3)
 
+    if music_path and os.path.exists(music_path):
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-i", music_path,
+            "-filter_complex",
+            f"[1:a]volume=0.08,afade=t=in:d=2,"
+            f"afade=t=out:st={fade_out_start}:d=3[music];"
+            f"[0:a][music]amix=inputs=2:duration=first[aout]",
+            "-map", "0:v",
+            "-map", "[aout]",
+            "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            output_path,
+        ]
 
-def _escape_path(path: str) -> str:
-    """Escape a filesystem path for use inside an FFmpeg filter argument."""
-    return path.replace("\\", "/").replace(":", "\\:")
-
-
-def _escape_text(text: str) -> str:
-    """Escape text for the drawtext filter."""
-    text = text[:120]
-    return (text.replace("\\", "\\\\")
-                .replace(":", "\\:")
-                .replace("'", "’")
-                .replace("%", "\\%"))
-
-
-def _find_font() -> str | None:
-    for p in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "C:/Windows/Fonts/arialbd.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-    ):
-        if os.path.exists(p):
-            return p
-    return None
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path

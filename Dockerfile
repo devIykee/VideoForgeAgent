@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
-# System deps: ffmpeg (assembly), libsndfile1 (audio I/O), espeak-ng (Kokoro G2P),
-# fonts (drawtext/subtitles overlays).
+# System deps: ffmpeg (footage/audio/assembly), libsndfile1 (Coqui audio I/O),
+# espeak-ng (Coqui XTTS phonemizer), fonts (drawtext subtitle/label overlays).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libsndfile1 \

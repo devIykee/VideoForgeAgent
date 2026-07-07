@@ -1,1 +1,1 @@
-"""VideoForge pipeline tools."""
+"""MinecraftCast pipeline tools."""

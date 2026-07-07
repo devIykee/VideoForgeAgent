@@ -1,4 +1,4 @@
-"""SQLite job tracking for VideoForgeAgent.
+"""SQLite job tracking for MinecraftCast.
 
 Async access via aiosqlite. A single jobs table records the full lifecycle of
 every video generation job so concurrent orders can be tracked independently.
@@ -8,7 +8,7 @@ import json
 import datetime
 import aiosqlite
 
-DB_PATH = "videoforge.db"
+DB_PATH = "minecraftcast.db"
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS jobs (

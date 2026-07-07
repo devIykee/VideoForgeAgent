@@ -1,16 +1,25 @@
-croo-sdk>=0.1.0
-# openai client covers Groq, OpenAI, Ollama, Gemini, and Mistral (all
-# OpenAI-compatible endpoints). anthropic + google sdk cover the rest.
-openai>=1.0.0
-anthropic>=0.40.0
-google-generativeai>=0.8.0
-kokoro>=0.9.0
-openai-whisper>=20231117
-torch>=2.0.0
-torchaudio>=2.0.0
-boto3>=1.26.0
-aiohttp>=3.8.0
-aiosqlite>=0.19.0
-python-dotenv>=1.0.0
+# ── Core ─────────────────────────────────────────
+# Groq speaks the OpenAI chat-completions protocol, so the openai client drives it.
+groq
+openai
+yt-dlp
+aiohttp
+requests
+Pillow>=10.0.0
+
+# ── Voice (Coqui local TTS) ──────────────────────
+TTS
+torch
+torchaudio
+
+# ── Persistence / config ─────────────────────────
+aiosqlite
+python-dotenv
 pydantic>=2.0.0
-numpy>=1.24.0
+
+# ── Integrations (optional layers) ───────────────
+fastapi
+uvicorn
+mcp
+croo-sdk
+boto3
