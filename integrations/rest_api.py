@@ -1,8 +1,13 @@
 """FastAPI REST wrapper for MinecraftCast (optional layer).
 
 Exposes the core pipeline over HTTP so any platform that can make requests —
-Discord bots, web apps, other agents — can generate videos. Generation runs in a
-background task; poll ``/job/{job_id}`` for status.
+Discord bots, web apps, other agents — can generate videos.
+
+Two entry points:
+* ``POST /generate`` — async: queues the job, poll ``/job/{job_id}``, then
+  ``/download/{job_id}``. Use where the host keeps CPU alive between requests.
+* ``POST /render``   — sync: renders inside the request and returns the MP4.
+  Use on request-scoped-CPU platforms (e.g. Google Cloud Run).
 
 Run: ``uvicorn integrations.rest_api:app --host 0.0.0.0 --port 8000``
 """
@@ -42,6 +47,29 @@ class GenerateRequest(BaseModel):
     footage_type: str = "survival gameplay"
 
 
+def _config_from_request(req: "GenerateRequest", job_id: str) -> VideoConfig:
+    """Build a VideoConfig from an API request body."""
+    return VideoConfig(
+        topic=req.topic,
+        char1=CharacterConfig(
+            name=req.char1_name,
+            personality=req.char1_personality,
+            voice_provider=req.voice_provider,
+            avatar_skin="alex", shirt_color="#6AA84F",
+        ),
+        char2=CharacterConfig(
+            name=req.char2_name,
+            personality=req.char2_personality,
+            voice_provider=req.voice_provider,
+            avatar_skin="steve", shirt_color="#3B6BB5",
+        ),
+        duration_minutes=req.duration_minutes,
+        footage_source=req.footage_source,
+        footage_type=req.footage_type,
+        job_id=job_id,
+    )
+
+
 async def _run_job(config: VideoConfig) -> None:
     """Background worker: run the pipeline and record status in the DB."""
     try:
@@ -65,27 +93,29 @@ async def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     await db.create_job(job_id, req.dict())
 
-    config = VideoConfig(
-        topic=req.topic,
-        char1=CharacterConfig(
-            name=req.char1_name,
-            personality=req.char1_personality,
-            voice_provider=req.voice_provider,
-            avatar_skin="alex", shirt_color="#6AA84F",
-        ),
-        char2=CharacterConfig(
-            name=req.char2_name,
-            personality=req.char2_personality,
-            voice_provider=req.voice_provider,
-            avatar_skin="steve", shirt_color="#3B6BB5",
-        ),
-        duration_minutes=req.duration_minutes,
-        footage_source=req.footage_source,
-        footage_type=req.footage_type,
-        job_id=job_id,
-    )
+    config = _config_from_request(req, job_id)
     background_tasks.add_task(_run_job, config)
     return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/render")
+async def render(req: GenerateRequest):
+    """Synchronously render a video and return the MP4 in the response.
+
+    Unlike ``/generate`` (which renders in a background task and is polled), this
+    runs the whole pipeline *inside the request*. Use it on platforms that only
+    allocate CPU during an active request — e.g. Google Cloud Run — where a
+    background task would be frozen after the response is sent. The client waits
+    the full render time (~5–8 min for a short clip), so keep durations small.
+    """
+    job_id = str(uuid.uuid4())
+    config = _config_from_request(req, job_id)
+    try:
+        final_path = await run_pipeline(config)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Render failed: {e}")
+    return FileResponse(final_path, media_type="video/mp4",
+                        filename=f"{job_id}.mp4")
 
 
 @app.get("/job/{job_id}")
