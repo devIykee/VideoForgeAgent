@@ -44,6 +44,7 @@ out/
 *.mp3
 *.wav
 *.srt
+.claude/
 
 # ── Local model caches ───────────────────────────────────
 .cache/

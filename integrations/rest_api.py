@@ -7,10 +7,15 @@ background task; poll ``/job/{job_id}`` for status.
 Run: ``uvicorn integrations.rest_api:app --host 0.0.0.0 --port 8000``
 """
 
+import os
 import uuid
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+load_dotenv()
 
 import db
 from pipeline import run as run_pipeline
@@ -31,7 +36,7 @@ class GenerateRequest(BaseModel):
     char1_personality: str = "energetic and funny"
     char2_name: str = "Steve"
     char2_personality: str = "calm and skeptical"
-    voice_provider: str = "elevenlabs"
+    voice_provider: str = "edge"
     duration_minutes: float = 3.0
     footage_source: str = "youtube"
     footage_type: str = "survival gameplay"
@@ -90,6 +95,21 @@ async def job_status(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+
+@app.get("/download/{job_id}")
+async def download(job_id: str):
+    """Download the finished MP4 for a completed job."""
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "complete":
+        raise HTTPException(409, f"Job not ready (status: {job.get('status')})")
+    path = job.get("output_url")
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file missing")
+    return FileResponse(path, media_type="video/mp4",
+                        filename=f"{job_id}.mp4")
 
 
 @app.get("/health")

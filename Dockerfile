@@ -16,4 +16,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Writable scratch/output dirs (Hugging Face Spaces may run as a non-root user).
+# The DB lives in /tmp so it's writable regardless of the runtime UID.
+RUN mkdir -p /app/output /app/uploads /tmp/minecraftcast \
+    && chmod -R 777 /app/output /app/uploads /tmp/minecraftcast
+ENV MINECRAFTCAST_DB_PATH=/tmp/minecraftcast.db
+
+# Default container mode = REST API on 7860 (Hugging Face Spaces convention).
+# ENABLE_CROO=true (set by the CROO compose file) takes precedence at runtime,
+# so this env is harmless for the CROO deployment.
+ENV SERVE_REST=true \
+    PORT=7860
+EXPOSE 7860
+
 CMD ["python", "main.py"]

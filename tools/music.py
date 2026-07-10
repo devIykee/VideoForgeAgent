@@ -61,8 +61,15 @@ async def fetch(mood: str, job_id: str) -> str:
                             with open(cache_path, "wb") as f:
                                 async for chunk in r.content.iter_chunked(1 << 16):
                                     f.write(chunk)
-                if os.path.exists(cache_path) and os.path.getsize(cache_path) > 1024:
+                # Only accept the download if it is genuinely playable audio.
+                # Pixabay's public API serves images, so a "hit" URL can quietly
+                # be a JPEG — which would later break the assembly mix step.
+                if (os.path.exists(cache_path)
+                        and os.path.getsize(cache_path) > 1024
+                        and _has_audio_stream(cache_path)):
                     return cache_path
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)  # drop the bad (non-audio) download
             except Exception as e:  # noqa: BLE001 — fall back to silence
                 print(f"      Music download failed for '{mood}': {e}")
 
@@ -86,10 +93,27 @@ async def _search_track(query: str) -> str | None:
         return None
 
     for hit in data.get("hits", []):
-        for key in ("audio", "download_url", "url", "previewURL"):
+        # Only real audio fields — ``url``/``previewURL`` on a Pixabay hit are
+        # image links, not music, and must never be treated as a track.
+        for key in ("audio", "download_url"):
             if hit.get(key):
                 return hit[key]
     return None
+
+
+def _has_audio_stream(path: str) -> bool:
+    """Return True if ffprobe finds at least one audio stream in ``path``."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-select_streams", "a",
+             "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True,
+        )
+    except Exception:  # noqa: BLE001 — ffprobe missing/failed => treat as unusable
+        return False
+    return "audio" in probe.stdout
 
 
 def _generate_silent_track(path: str, seconds: int = 900) -> None:

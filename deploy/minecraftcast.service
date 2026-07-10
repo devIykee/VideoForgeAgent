@@ -1,0 +1,31 @@
+# systemd unit to keep the MinecraftCast CROO provider online 24/7.
+#
+# Install:
+#   sudo cp deploy/minecraftcast.service /etc/systemd/system/minecraftcast.service
+#   # edit User, WorkingDirectory, and ExecStart paths below to match your box
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now minecraftcast
+#
+# Logs:   journalctl -u minecraftcast -f
+# Stop:   sudo systemctl stop minecraftcast
+# Status: systemctl status minecraftcast
+
+[Unit]
+Description=MinecraftCast CROO Agent provider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=minecraft
+WorkingDirectory=/opt/minecraftcast
+# .env is loaded by python-dotenv at startup; ENABLE_CROO must be true.
+Environment=ENABLE_CROO=true
+ExecStart=/opt/minecraftcast/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+# Give a long render enough time before systemd considers a restart "failed-fast".
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

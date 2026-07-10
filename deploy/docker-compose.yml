@@ -1,0 +1,33 @@
+# Keep the MinecraftCast CROO provider online with Docker.
+#
+#   cd <repo root>
+#   cp .env.example .env         # fill in keys; set ENABLE_CROO=true
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Logs:   docker compose -f deploy/docker-compose.yml logs -f
+# Stop:   docker compose -f deploy/docker-compose.yml down
+#
+# Runs exactly one provider process (the SDK allows one active WebSocket per
+# API key). `restart: unless-stopped` brings it back after crashes/reboots.
+
+services:
+  provider:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: minecraftcast:latest
+    container_name: minecraftcast-provider
+    env_file:
+      - ../.env
+    environment:
+      ENABLE_CROO: "true"
+      MINECRAFTCAST_DB_PATH: "/app/data/minecraftcast.db"
+    # Persist finished videos and the job DB across restarts.
+    volumes:
+      - ../output:/app/output
+      - ../uploads:/app/uploads
+      - mc-db:/app/data
+    restart: unless-stopped
+
+volumes:
+  mc-db:

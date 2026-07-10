@@ -7,10 +7,15 @@ aiohttp
 requests
 Pillow>=10.0.0
 
-# ── Voice (Coqui local TTS) ──────────────────────
-TTS
-torch
-torchaudio
+# ── Voice ────────────────────────────────────────
+# edge-tts: free Microsoft neural TTS (no API key) — the default engine.
+edge-tts
+
+# Coqui local TTS (optional; only for VOICE_PROVIDER=coqui). Heavy (~2 GB with
+# torch). Uncomment only if you want fully-local voice cloning.
+# TTS
+# torch
+# torchaudio
 
 # ── Persistence / config ─────────────────────────
 aiosqlite

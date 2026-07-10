@@ -4,11 +4,14 @@ Async access via aiosqlite. A single jobs table records the full lifecycle of
 every video generation job so concurrent orders can be tracked independently.
 """
 
+import os
 import json
 import datetime
 import aiosqlite
 
-DB_PATH = "minecraftcast.db"
+# Overridable so containerized deploys can point it at a mounted volume
+# (e.g. MINECRAFTCAST_DB_PATH=/app/data/minecraftcast.db).
+DB_PATH = os.getenv("MINECRAFTCAST_DB_PATH", "minecraftcast.db")
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS jobs (

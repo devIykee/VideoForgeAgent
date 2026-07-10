@@ -17,7 +17,10 @@ def get_voice_engine(provider: str):
     elif provider == "coqui":
         from tools.voice_coqui import CoquiVoice
         return CoquiVoice()
+    elif provider == "edge":
+        from tools.voice_edge import EdgeVoice
+        return EdgeVoice()
     else:
         raise ValueError(
-            f"Unknown voice provider: {provider}. Use 'elevenlabs' or 'coqui'"
+            f"Unknown voice provider: {provider}. Use 'elevenlabs', 'coqui', or 'edge'"
         )

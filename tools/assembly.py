@@ -37,6 +37,30 @@ def _escape_drawtext(text: str) -> str:
     return text
 
 
+def _drawtext_font() -> str:
+    """Return a ``fontfile='...':`` fragment for drawtext, or ``''`` to use the
+    fontconfig default.
+
+    On Linux/Docker (where DejaVu + fontconfig are installed) no explicit font is
+    needed. On Windows there is usually no fontconfig default, so we fall back to
+    a known system font. Override the font on any platform with the
+    ``MINECRAFTCAST_FONT`` env var (an absolute path to a .ttf/.otf).
+    """
+    font = os.getenv("MINECRAFTCAST_FONT", "")
+    if not font and os.name == "nt":
+        for candidate in (r"C:\Windows\Fonts\arial.ttf",
+                          r"C:\Windows\Fonts\segoeui.ttf",
+                          r"C:\Windows\Fonts\calibri.ttf"):
+            if os.path.isfile(candidate):
+                font = candidate
+                break
+    if not font:
+        return ""  # rely on fontconfig (Linux/Docker)
+    # Escape for the filtergraph: forward slashes, and escape the drive colon.
+    font = font.replace("\\", "/").replace(":", "\\:")
+    return f"fontfile='{font}':"
+
+
 def _probe_duration(audio_path: str) -> float:
     """Return the duration in seconds of an audio file via ffprobe."""
     probe = subprocess.run(
@@ -109,6 +133,7 @@ def assemble_segment(seg_idx: int, seg: dict,
     # Subtitle bar via drawtext.
     filter_complex += (
         f"[tmp2]drawtext="
+        f"{_drawtext_font()}"
         f"text='{subtitle_text}':"
         f"fontcolor=white:"
         f"fontsize=28:"

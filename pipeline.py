@@ -15,6 +15,7 @@ Nothing in this module imports anything from ``integrations/``; the CROO layer
 """
 
 import os
+import sys
 import shutil
 
 from config import VideoConfig
@@ -26,8 +27,24 @@ from tools import assembly as assembly_tool
 from tools.avatar import AvatarGenerator
 
 
+def _force_utf8_console() -> None:
+    """Make stdout/stderr UTF-8 so the progress banners (═ ╔ ✓) never crash.
+
+    The Windows console defaults to a legacy code page (cp1252) that can't encode
+    the box-drawing / check characters we print. Reconfiguring to UTF-8 with
+    ``errors="replace"`` keeps output readable on every platform. No-op where the
+    streams don't support reconfiguration.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 — best effort; never fatal
+            pass
+
+
 async def run(config: VideoConfig) -> str:
     """Run the full MinecraftCast pipeline. Returns the final MP4 path."""
+    _force_utf8_console()
     job_id = config.job_id
     os.makedirs(f"/tmp/minecraftcast/{job_id}", exist_ok=True)
 
